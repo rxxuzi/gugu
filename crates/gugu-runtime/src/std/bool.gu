@@ -1,0 +1,58 @@
+# std/bool.gu — boolean logic on built-in @TRUE / @FALSE.
+#
+#   @AND /rgt /result     fuse ~~ one operand (a);
+#                         /rgt is a bond to the other operand (b);
+#                         /result receives  a AND b
+#
+#   @OR  /rgt /result     same shape;          result = a OR b
+#   @NOT /result          fuse ~~ operand; result = NOT operand
+#   @XOR /rgt /result     same shape as AND/OR; result = a XOR b
+#                         (XOR with TRUE = NOT, XOR with FALSE = identity)
+#   @IF  /then /else /result
+#                         fuse ~~ condition (@TRUE / @FALSE);
+#                         on TRUE  → /then flows to /result, /else is erased
+#                         on FALSE → /else flows to /result, /then is erased
+#
+# TRUE / FALSE are built-ins (see gugu-core/src/agent.rs).
+
+agent @AND /rgt /result
+agent @OR  /rgt /result
+agent @NOT /result
+agent @XOR /rgt /result
+agent @IF  /then /else /result
+
+rule @AND >< @TRUE :
+  ~/result -- ~/rgt
+
+rule @AND >< @FALSE :
+  ~/result -- @FALSE
+  ~/rgt -- @ERA
+
+rule @OR >< @TRUE :
+  ~/result -- @TRUE
+  ~/rgt -- @ERA
+
+rule @OR >< @FALSE :
+  ~/result -- ~/rgt
+
+rule @NOT >< @TRUE :
+  ~/result -- @FALSE
+
+rule @NOT >< @FALSE :
+  ~/result -- @TRUE
+
+rule @XOR >< @TRUE :
+  # XOR(TRUE, rgt) = NOT(rgt)
+  @NOT /result=~/result -- ~/rgt
+
+rule @XOR >< @FALSE :
+  # XOR(FALSE, rgt) = rgt
+  ~/result -- ~/rgt
+
+rule @IF >< @TRUE :
+  ~/then -- ~/result
+  ~/else -- @ERA
+
+rule @IF >< @FALSE :
+  ~/else -- ~/result
+  ~/then -- @ERA

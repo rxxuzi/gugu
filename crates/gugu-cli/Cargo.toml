@@ -1,0 +1,15 @@
+[package]
+name = "gugu-cli"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "gugu"
+path = "src/main.rs"
+
+[dependencies]
+gugu-lexer = { path = "../gugu-lexer" }
+gugu-parser = { path = "../gugu-parser" }
+gugu-runtime = { path = "../gugu-runtime" }
+gugu-codegen = { path = "../gugu-codegen" }

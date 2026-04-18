@@ -1,0 +1,9 @@
+[package]
+name = "gugu-codegen"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+gugu-core = { path = "../gugu-core" }
+gugu-parser = { path = "../gugu-parser" }

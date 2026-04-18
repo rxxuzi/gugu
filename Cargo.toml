@@ -1,0 +1,19 @@
+[workspace]
+members = [
+    "crates/gugu-core",
+    "crates/gugu-lexer",
+    "crates/gugu-parser",
+    "crates/gugu-reducer",
+    "crates/gugu-runtime",
+    "crates/gugu-codegen",
+    "crates/gugu-cli",
+]
+resolver = "3"
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+license = "MIT"
+
+[workspace.dependencies]
+gugu-core = { path = "crates/gugu-core" }

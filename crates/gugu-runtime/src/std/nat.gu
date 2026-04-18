@@ -1,0 +1,165 @@
+# std/nat.gu — natural number arithmetic on BIT0/BIT1/ZERO chains.
+#
+# Automatically loaded before every user program (see lower.rs).
+#
+# Nat = LSB-first chain of BIT0/BIT1 terminated by ZERO.
+#   e.g. 5 = BIT1 -- BIT0 -- BIT1 -- ZERO  (fuse = LSB)
+#
+#   @ADD  /lft /rgt     fuse consumes rgt Nat (LSB-first);
+#                       result = lft + rgt  →  /rgt
+#   @ADDC /lft /rgt     like @ADD but with a +1 carry;
+#                       result = lft + rgt + 1  →  /rgt
+#
+# When the fuse peels a bit off rgt, the output's bit-0 depends on
+# lft's LSB, so we switch to peeling lft via one of three helpers:
+#
+#   @PL0 /rgt /out      fuse consumes lft Nat;
+#                       /rgt is a bond to the remaining rgt Nat;
+#                       result = lft + 2*rgt  →  /out       (carry 0)
+#   @PL1 /rgt /out      result = lft + 2*rgt + 1  →  /out   (carry 1)
+#   @PL2 /rgt /out      result = lft + 2*rgt + 2  →  /out   (carry 2, needed
+#                                                           for ADDC >< BIT1)
+
+agent @ADD  /lft /rgt
+agent @ADDC /lft /rgt
+agent @PL0  /rgt /out
+agent @PL1  /rgt /out
+agent @PL2  /rgt /out
+
+# SUB: precondition lft >= rgt.  If the precondition is violated, the
+# result is implementation-defined (lft=0 cases saturate to ZERO; other
+# underflows produce a truncated low-bit pattern).
+agent @SUB  /lft /rgt
+agent @SUBB /lft /rgt       # lft - rgt - 1 (borrow in)
+agent @SL0  /rgt /out       # peel lft, borrow 0 — result = lft - 2*rgt
+agent @SL1  /rgt /out       # peel lft, borrow 1 — result = lft - 2*rgt - 1
+agent @SL2  /rgt /out       # peel lft, borrow 2 — result = lft - 2*rgt - 2
+
+# MUL: lft duplicated via built-in @DUP when an rgt bit = 1.
+agent @MUL  /lft /rgt
+
+rule @ADD >< @ZERO :
+  ~/lft -- ~/rgt
+
+rule @ADD >< @BIT0 :
+  @PL0 /rgt=~/hi /out=~/rgt -- ~/lft
+
+rule @ADD >< @BIT1 :
+  @PL1 /rgt=~/hi /out=~/rgt -- ~/lft
+
+rule @ADDC >< @ZERO :
+  @PL1 /rgt=@ZERO /out=~/rgt -- ~/lft
+
+rule @ADDC >< @BIT0 :
+  @PL1 /rgt=~/hi /out=~/rgt -- ~/lft
+
+rule @ADDC >< @BIT1 :
+  @PL2 /rgt=~/hi /out=~/rgt -- ~/lft
+
+rule @PL0 >< @ZERO :
+  ~/out -- @BIT0 /hi=~/rgt
+
+rule @PL0 >< @BIT0 :
+  ~/out -- @BIT0 /hi=>>w
+  @ADD /lft=~/hi /rgt=>>w -- ~/rgt
+
+rule @PL0 >< @BIT1 :
+  ~/out -- @BIT1 /hi=>>w
+  @ADD /lft=~/hi /rgt=>>w -- ~/rgt
+
+rule @PL1 >< @ZERO :
+  ~/out -- @BIT1 /hi=~/rgt
+
+rule @PL1 >< @BIT0 :
+  ~/out -- @BIT1 /hi=>>w
+  @ADD /lft=~/hi /rgt=>>w -- ~/rgt
+
+rule @PL1 >< @BIT1 :
+  ~/out -- @BIT0 /hi=>>w
+  @ADDC /lft=~/hi /rgt=>>w -- ~/rgt
+
+rule @PL2 >< @ZERO :
+  ~/out -- @BIT0 /hi=>>w
+  @ADDC /lft=@ZERO /rgt=>>w -- ~/rgt
+
+rule @PL2 >< @BIT0 :
+  ~/out -- @BIT0 /hi=>>w
+  @ADDC /lft=~/hi /rgt=>>w -- ~/rgt
+
+rule @PL2 >< @BIT1 :
+  ~/out -- @BIT1 /hi=>>w
+  @ADDC /lft=~/hi /rgt=>>w -- ~/rgt
+
+rule @SUB >< @ZERO :
+  ~/lft -- ~/rgt
+
+rule @SUB >< @BIT0 :
+  @SL0 /rgt=~/hi /out=~/rgt -- ~/lft
+
+rule @SUB >< @BIT1 :
+  @SL1 /rgt=~/hi /out=~/rgt -- ~/lft
+
+rule @SUBB >< @ZERO :
+  @SL1 /rgt=@ZERO /out=~/rgt -- ~/lft
+
+rule @SUBB >< @BIT0 :
+  @SL1 /rgt=~/hi /out=~/rgt -- ~/lft
+
+rule @SUBB >< @BIT1 :
+  @SL2 /rgt=~/hi /out=~/rgt -- ~/lft
+
+# The ZERO case is reached only when lft underflowed the subtraction
+# (i.e. the caller broke the lft >= rgt precondition). We saturate the
+# result at zero and erase the remaining rgt chain.
+
+rule @SL0 >< @ZERO :
+  ~/out -- @ZERO
+  ~/rgt -- @ERA
+
+rule @SL0 >< @BIT0 :
+  ~/out -- @BIT0 /hi=>>w
+  @SUB /lft=~/hi /rgt=>>w -- ~/rgt
+
+rule @SL0 >< @BIT1 :
+  ~/out -- @BIT1 /hi=>>w
+  @SUB /lft=~/hi /rgt=>>w -- ~/rgt
+
+rule @SL1 >< @ZERO :
+  ~/out -- @ZERO
+  ~/rgt -- @ERA
+
+rule @SL1 >< @BIT0 :
+  ~/out -- @BIT1 /hi=>>w
+  @SUBB /lft=~/hi /rgt=>>w -- ~/rgt
+
+rule @SL1 >< @BIT1 :
+  ~/out -- @BIT0 /hi=>>w
+  @SUB /lft=~/hi /rgt=>>w -- ~/rgt
+
+rule @SL2 >< @ZERO :
+  ~/out -- @ZERO
+  ~/rgt -- @ERA
+
+rule @SL2 >< @BIT0 :
+  ~/out -- @BIT0 /hi=>>w
+  @SUBB /lft=~/hi /rgt=>>w -- ~/rgt
+
+rule @SL2 >< @BIT1 :
+  ~/out -- @BIT1 /hi=>>w
+  @SUBB /lft=~/hi /rgt=>>w -- ~/rgt
+
+rule @MUL >< @ZERO :
+  ~/rgt -- @ZERO
+  ~/lft -- @ERA
+
+rule @MUL >< @BIT0 :
+  # lft * 2*hi → BIT0(MUL(lft, hi))
+  ~/rgt -- @BIT0 /hi=>>w
+  @MUL /lft=~/lft /rgt=>>w -- ~/hi
+
+rule @MUL >< @BIT1 :
+  # lft * (2*hi+1) = lft + 2*(lft*hi).  Split lft via @DUP, then
+  # ADD(l1, BIT0(MUL(l2, hi))) → ~/rgt.
+  @DUP /c1=>>l1 /c2=>>l2 -- ~/lft
+  @ADD /lft=>>l1 /rgt=~/rgt -- @BIT0 /hi=>>m
+  @MUL /lft=>>l2 /rgt=>>m -- ~/hi

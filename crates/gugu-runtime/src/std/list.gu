@@ -1,0 +1,28 @@
+# std/list.gu — list operations on @CONS / @NIL.
+#
+# @HEAD /result   fuse ~~ list; /result receives the head element
+# @TAIL /result   fuse ~~ list; /result receives a list of the tail
+#
+# CONS and NIL are built-ins (see gugu-core/src/agent.rs); they are shared
+# with string literals — "hi" is just CONS(CHAR('h'), CONS(CHAR('i'), NIL)).
+#
+# MAP / FOLD / FILTER need generic function application (fn's /result bond
+# threaded through DUP fan-out); that is deferred until Phase 3 adds
+# wildcard rules or fragment templates.
+
+agent @HEAD /result
+agent @TAIL /result
+
+rule @HEAD >< @CONS :
+  ~/result -- ~/head
+  ~/tail -- @ERA
+
+rule @HEAD >< @NIL :
+  ~/result -- @ERR
+
+rule @TAIL >< @CONS :
+  ~/result -- ~/tail
+  ~/head -- @ERA
+
+rule @TAIL >< @NIL :
+  ~/result -- @NIL

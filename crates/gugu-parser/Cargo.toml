@@ -1,0 +1,8 @@
+[package]
+name = "gugu-parser"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+gugu-lexer = { path = "../gugu-lexer" }

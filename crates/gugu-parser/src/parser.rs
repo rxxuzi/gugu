@@ -656,7 +656,14 @@ impl Parser {
 
     fn parse_paren(&mut self) -> Result<Expr, ParseError> {
         let start = self.advance().span;
-        let inner = self.parse_connect()?;
+        let mut inner = self.parse_connect()?;
+        // Greedy positional inside parens — `(@BIT1 @ZERO)` means @BIT1
+        // with @ZERO as a positional arm. Outside parens the stmt-level
+        // parser stays conservative so adjacent atoms form separate stmts.
+        while self.peek() != Some(&TokenKind::RParen) && !self.at_end() {
+            let extra = self.parse_connect()?;
+            inner = attach_positional(inner, extra)?;
+        }
         self.expect(&TokenKind::RParen)?;
         Ok(Expr::Paren(Box::new(inner), self.span_from(start)))
     }
@@ -714,6 +721,26 @@ impl Parser {
             }
             _ => Err(self.err("expected string literal")),
         }
+    }
+}
+
+/// Treat `extra` as a positional arg of `outer`. Only meaningful when
+/// `outer` is an `@AGENT` expr; otherwise the trailing atom is a parse
+/// error.
+fn attach_positional(outer: Expr, extra: Expr) -> Result<Expr, ParseError> {
+    match outer {
+        Expr::Agent {
+            name,
+            mut args,
+            span,
+        } => {
+            args.push(AgentArg::Positional(extra));
+            Ok(Expr::Agent { name, args, span })
+        }
+        _ => Err(ParseError {
+            msg: "positional arg must follow an agent".into(),
+            span: extra.span(),
+        }),
     }
 }
 

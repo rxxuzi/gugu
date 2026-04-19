@@ -12,6 +12,19 @@ fn mul(l: i64, r: i64) -> String {
 }
 
 #[test]
+fn label_threads_a_real_bond() {
+    // `/a` on the left of `--` in one stmt and inside `/lft=/a` in another
+    // must form a single genuine bond between the `1` literal and @ADD's
+    // /lft arm. If the bridge is broken the output would be 0 or garbage.
+    let src = "\
+        @GEN :\n  \
+          /a -- 1\n  \
+          @ADD /lft=/a /rgt=(>out) -> 2\n\
+    ";
+    assert_eq!(run_one(src), "3");
+}
+
+#[test]
 fn add_identity_with_zero() {
     for n in [0_i64, 1, 7, 255, 1024, 65535] {
         assert_eq!(add(n, 0), n.to_string(), "ADD({n}, 0)");
@@ -95,11 +108,23 @@ fn sub_boundary_borrow_across_bits() {
 }
 
 #[test]
-fn sub_from_zero_saturates() {
-    // lft = 0 hits SL1/SL2 >< ZERO → saturates to 0.
+fn sub_underflow_emits_err() {
+    // Precondition `lft >= rgt` violation — SL1/SL2 meeting @ZERO must
+    // emit @ERR, not a silent 0.  Principle 6: errors never hide.
     for n in [1_i64, 7, 42, 1000] {
-        assert_eq!(sub(0, n), "0", "SUB(0, {n})");
+        let out = sub(0, n);
+        assert!(
+            out.starts_with("ERR"),
+            "SUB(0, {n}) should emit ERR, got {out}"
+        );
     }
+    // Partial-underflow case (3 - 5): the low bits get built before the
+    // lft chain exhausts, so the result is a BIT prefix ending in ERR.
+    let partial = sub(3, 5);
+    assert!(
+        partial.contains("ERR"),
+        "SUB(3, 5) should contain ERR, got {partial}"
+    );
 }
 
 #[test]

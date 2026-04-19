@@ -7,9 +7,9 @@ fn main() {
         eprintln!("usage: gugu <command> [args]");
         eprintln!();
         eprintln!("commands:");
-        eprintln!("  run <file.gu>    Run a .gu program");
-        eprintln!("  check <file.gu>  Parse and type-check (no execution)");
-        eprintln!("  lex <file.gu>    Dump tokens");
+        eprintln!("  run [--trace] <file.gu>   Run a .gu program");
+        eprintln!("  check <file.gu>           Parse and type-check (no execution)");
+        eprintln!("  lex <file.gu>             Dump tokens");
         process::exit(1);
     }
 
@@ -41,7 +41,11 @@ fn read_file(args: &[String]) -> String {
 }
 
 fn cmd_run(args: &[String]) {
-    let src = read_file(args);
+    let (trace, rest) = match args.split_first() {
+        Some((f, rest)) if f == "--trace" => (true, rest),
+        _ => (false, args),
+    };
+    let src = read_file(rest);
 
     let program = match gugu_parser::parse(&src) {
         Ok(p) => p,
@@ -51,7 +55,17 @@ fn cmd_run(args: &[String]) {
         }
     };
 
-    match gugu_runtime::exec(&program) {
+    // --trace prints every bloom; without it, only blooms touching a `?`
+    // inspected atom surface. Both route through exec_traced.
+    let result = gugu_runtime::exec_traced(&program, |t| {
+        if trace {
+            eprintln!("[bloom {:>4}] @{} >< @{}", t.count, t.lhs, t.rhs);
+        } else if t.inspected {
+            eprintln!("[inspect {:>4}] @{} >< @{}", t.count, t.lhs, t.rhs);
+        }
+    });
+
+    match result {
         Ok(result) => {
             for line in gugu_runtime::read_outputs(&result) {
                 println!("{line}");

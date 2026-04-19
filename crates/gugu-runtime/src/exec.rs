@@ -1,10 +1,19 @@
 //! Execution: lower + reduce + extract result.
 
-use gugu_core::{AgentType, Web, AtomId, PortId};
+use gugu_core::{AgentType, AtomId, PortId, Web};
 use gugu_parser::ast::Program;
-use gugu_reducer::{Reducer, RunResult};
+use gugu_reducer::{BloomInfo, Reducer, RunResult};
 
-use crate::lower::{self, LowerError, LowerResult};
+use crate::lower::{self, AgentRegistry, LowerError, LowerResult};
+
+/// Per-bloom info surfaced to `exec_traced` callbacks.
+#[derive(Debug, Clone)]
+pub struct Trace<'a> {
+    pub count: u64,
+    pub lhs: &'a str,
+    pub rhs: &'a str,
+    pub inspected: bool,
+}
 
 const MAX_STEPS: u64 = 1_000_000;
 
@@ -36,6 +45,16 @@ pub struct ExecResult {
 
 /// Run a parsed program to slag and return the result.
 pub fn exec(program: &Program) -> Result<ExecResult, ExecError> {
+    exec_traced(program, |_| {})
+}
+
+/// Like `exec`, but `on_bloom(Trace { .. })` is called before every bloom
+/// with resolved agent names and the `?`-inspection flag. Backs
+/// `gugu run --trace` and `?expr` routing.
+pub fn exec_traced(
+    program: &Program,
+    mut on_bloom: impl FnMut(Trace<'_>),
+) -> Result<ExecResult, ExecError> {
     let LowerResult {
         web,
         rules,
@@ -44,7 +63,15 @@ pub fn exec(program: &Program) -> Result<ExecResult, ExecError> {
     } = lower::lower(program).map_err(ExecError::Lower)?;
 
     let mut reducer = Reducer::new(web, rules);
-    match reducer.run(MAX_STEPS) {
+    let result = reducer.run_traced(MAX_STEPS, |info: BloomInfo| {
+        on_bloom(Trace {
+            count: info.count,
+            lhs: &agent_name_of(&registry, info.a),
+            rhs: &agent_name_of(&registry, info.b),
+            inspected: info.inspected,
+        });
+    });
+    match result {
         RunResult::Slag(blooms) => Ok(ExecResult {
             web: reducer.web,
             output_ports,
@@ -53,6 +80,12 @@ pub fn exec(program: &Program) -> Result<ExecResult, ExecError> {
         }),
         RunResult::MaxSteps(n) => Err(ExecError::MaxSteps(n)),
     }
+}
+
+fn agent_name_of(reg: &AgentRegistry, ty: AgentType) -> String {
+    reg.def(ty)
+        .map(|d| d.name.clone())
+        .unwrap_or_else(|| format!("?{}", ty.raw()))
 }
 
 /// Read the results from each `@GEN`'s `>out`, in declaration order.

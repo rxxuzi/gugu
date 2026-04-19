@@ -72,3 +72,90 @@ fn anon_wire_three_times_rejected() {
         e.msg
     );
 }
+
+#[test]
+fn label_once_rejected() {
+    // `/a` referenced once is a dangling bond — half of a bond with no
+    // second endpoint. Catch it the same way `>>w` is caught.
+    let src = "@GEN :\n  /a -- @ZERO\n  @ZERO -> >out\n";
+    let e = lower_err(src);
+    assert!(
+        e.msg.contains("/a") && e.msg.contains("exactly 2"),
+        "msg = {}",
+        e.msg
+    );
+}
+
+#[test]
+fn label_three_times_rejected() {
+    let src = "\
+        agent @FOO /a\n\
+        @GEN :\n  \
+          /b -- @ZERO\n  \
+          /b -- @ZERO\n  \
+          /b -- @ZERO\n  \
+          @ZERO -> >out\n\
+    ";
+    let e = lower_err(src);
+    assert!(
+        e.msg.contains("/b") && e.msg.contains("3 times"),
+        "msg = {}",
+        e.msg
+    );
+}
+
+#[test]
+fn output_used_twice_rejected() {
+    let src = "@GEN :\n  @ZERO -> >out\n  @ZERO -> >out\n";
+    let e = lower_err(src);
+    assert!(e.msg.contains(">out"), "msg = {}", e.msg);
+}
+
+#[test]
+fn rule_missing_self_port_rejected() {
+    // LHS has /b but the body never references it — the bond to /b's peer
+    // would vanish after bloom. Reject at lowering time.
+    let src = "\
+        agent @FOO /a /b\n\
+        rule @FOO >< @ZERO : ~/a -- @TRUE\n\
+        @GEN : @ZERO -> >out\n\
+    ";
+    let e = lower_err(src);
+    assert!(
+        e.msg.contains("~/b") && e.msg.contains("0 times"),
+        "msg = {}",
+        e.msg
+    );
+}
+
+#[test]
+fn rule_double_self_port_rejected() {
+    // Referencing ~/a twice would attempt two bonds on the same peer port.
+    let src = "\
+        agent @FOO /a /b\n\
+        rule @FOO >< @ZERO : ~/a -- ~/b   ~/a -- @TRUE\n\
+        @GEN : @ZERO -> >out\n\
+    ";
+    let e = lower_err(src);
+    assert!(
+        e.msg.contains("~/a") && e.msg.contains("2 times"),
+        "msg = {}",
+        e.msg
+    );
+}
+
+#[test]
+fn rule_must_cover_rhs_arms() {
+    // CONS has /head and /tail; omitting /tail leaves its peer dangling.
+    let src = "\
+        agent @TAKE /result\n\
+        rule @TAKE >< @CONS : ~/result -- ~/head\n\
+        @GEN : @ZERO -> >out\n\
+    ";
+    let e = lower_err(src);
+    assert!(
+        e.msg.contains("~/tail") && e.msg.contains("0 times"),
+        "msg = {}",
+        e.msg
+    );
+}

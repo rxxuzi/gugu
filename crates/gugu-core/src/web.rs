@@ -43,6 +43,12 @@ pub struct Web {
     port_to_bond: HashMap<PortId, Bond>,
     next_atom: u32,
     next_port: u32,
+    /// Atoms marked via `!expr` — the reducer fires sparks that touch any
+    /// of these before plain sparks.
+    forced: HashSet<AtomId>,
+    /// Atoms marked via `?expr` — the reducer emits a trace line whenever
+    /// one of them participates in a bloom.
+    inspected: HashSet<AtomId>,
 }
 
 impl Web {
@@ -54,7 +60,25 @@ impl Web {
             port_to_bond: HashMap::new(),
             next_atom: 0,
             next_port: 0,
+            forced: HashSet::new(),
+            inspected: HashSet::new(),
         }
+    }
+
+    pub fn force(&mut self, id: AtomId) {
+        self.forced.insert(id);
+    }
+
+    pub fn inspect(&mut self, id: AtomId) {
+        self.inspected.insert(id);
+    }
+
+    pub fn is_forced(&self, id: AtomId) -> bool {
+        self.forced.contains(&id)
+    }
+
+    pub fn is_inspected(&self, id: AtomId) -> bool {
+        self.inspected.contains(&id)
     }
 
     fn alloc_atom_id(&mut self) -> AtomId {
@@ -123,6 +147,8 @@ impl Web {
                 self.ports.remove(&pid);
             }
         }
+        self.forced.remove(&nid);
+        self.inspected.remove(&nid);
     }
 
     /// Find all active pairs: two atoms whose fuse are wired together.

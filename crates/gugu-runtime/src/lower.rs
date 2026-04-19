@@ -1,11 +1,12 @@
 //! AST → Web lowering.
 //!
 //! Walks the parsed Program, registers agent definitions, builds the
-//! rule table, and constructs the initial web (web) from the main block.
+//! rule table, and constructs the initial web from the main block.
 
 use std::collections::HashMap;
+use std::sync::Arc;
 
-use gugu_core::{AgentDef, AgentType, Web, AtomId, PortId};
+use gugu_core::{AgentDef, AgentType, AtomId, PortId, Web};
 use gugu_parser::ast;
 use gugu_reducer::RuleTable;
 
@@ -136,32 +137,45 @@ pub fn lower(program: &ast::Program) -> Result<LowerResult, LowerError> {
         register_agents(item, &mut reg)?;
     }
 
-    // Phase 2: register rules. Stdlib rules register first and win `lookup`
+    // Phase 2: collect fragments. Stdlib currently declares none, but keep
+    // the scan symmetric so future stdlib fragments get picked up too.
+    let mut frag_defs: HashMap<String, ast::FragDef> = HashMap::new();
+    for prog in &stdlib_programs {
+        for item in &prog.items {
+            register_fragment(item, &mut frag_defs)?;
+        }
+    }
+    for item in &program.items {
+        register_fragment(item, &mut frag_defs)?;
+    }
+    let fragments: FragMap = Arc::new(frag_defs);
+
+    // Phase 3: register rules. Stdlib rules register first and win `lookup`
     // ordering; user redefinitions of identical pairs are shadowed.
     for prog in &stdlib_programs {
         for item in &prog.items {
             if let ast::TopLevel::Rule(rule_def) = item {
-                register_rule(rule_def, &reg, &mut rules)?;
+                register_rule(rule_def, &reg, &mut rules, &fragments)?;
             }
         }
     }
     for item in &program.items {
         if let ast::TopLevel::Rule(rule_def) = item {
-            register_rule(rule_def, &reg, &mut rules)?;
+            register_rule(rule_def, &reg, &mut rules, &fragments)?;
         }
         if let ast::TopLevel::Mod(mod_def) = item {
             for mi in &mod_def.items {
                 if let ast::ModItem::Rule(rule_def) = mi {
-                    register_rule(rule_def, &reg, &mut rules)?;
+                    register_rule(rule_def, &reg, &mut rules, &fragments)?;
                 }
             }
         }
     }
 
-    // Phase 3: lower each @GEN block into the web as independent components
+    // Phase 4: lower each @GEN block into the web as independent components
     let mut output_ports = Vec::with_capacity(program.gens.len());
     for block in &program.gens {
-        output_ports.push(lower_gen(block, &reg, &mut web)?);
+        output_ports.push(lower_gen(block, &reg, &fragments, &mut web)?);
     }
 
     Ok(LowerResult {
@@ -185,6 +199,50 @@ fn register_agents(item: &ast::TopLevel, reg: &mut AgentRegistry) -> Result<(), 
         _ => {}
     }
     Ok(())
+}
+
+fn register_fragment(
+    item: &ast::TopLevel,
+    frags: &mut HashMap<String, ast::FragDef>,
+) -> Result<(), LowerError> {
+    let ast::TopLevel::Frag(f) = item else {
+        return Ok(());
+    };
+    if !f.ports.is_empty() {
+        return Err(err(format!(
+            "parameterized fragment ${} not yet supported",
+            f.name
+        )));
+    }
+    if let Some(bad) = find_self_port(&f.value) {
+        return Err(err(format!(
+            "fragment ${}: ~/{bad} has no LHS/RHS context to resolve against",
+            f.name
+        )));
+    }
+    if frags.contains_key(&f.name) {
+        return Err(err(format!("duplicate fragment ${}", f.name)));
+    }
+    frags.insert(f.name.clone(), f.clone());
+    Ok(())
+}
+
+fn find_self_port(e: &ast::Expr) -> Option<String> {
+    match e {
+        ast::Expr::SelfPort(n, _) => Some(n.clone()),
+        ast::Expr::Agent { args, .. } => args.iter().find_map(|a| match a {
+            ast::AgentArg::Port(pa) => find_self_port(&pa.value),
+            ast::AgentArg::Positional(e) => find_self_port(e),
+        }),
+        ast::Expr::Connect { lhs, rhs, .. } => {
+            find_self_port(lhs).or_else(|| find_self_port(rhs))
+        }
+        ast::Expr::Paren(i, _) | ast::Expr::Force(i, _) | ast::Expr::Inspect(i, _) => {
+            find_self_port(i)
+        }
+        ast::Expr::List { items, .. } => items.iter().find_map(find_self_port),
+        _ => None,
+    }
 }
 
 fn register_one_agent(a: &ast::AgentDef, reg: &mut AgentRegistry) -> Result<(), LowerError> {
@@ -216,6 +274,7 @@ fn register_rule(
     rule_def: &ast::RuleDef,
     reg: &AgentRegistry,
     rules: &mut RuleTable,
+    fragments: &FragMap,
 ) -> Result<(), LowerError> {
     let lhs_ty = reg
         .lookup(&rule_def.lhs)
@@ -232,7 +291,7 @@ fn register_rule(
                         rule_def.lhs, rhs_name
                     )));
                 }
-                let rpm = build_rule_port_map(reg, &rule_def.lhs, rhs_name);
+                let rpm = build_rule_port_map(reg, &rule_def.lhs, rhs_name, fragments.clone());
                 check_self_ports(&rule_def.body, &rule_def.lhs, rhs_name, &rpm)?;
                 let body = rule_def.body.clone();
                 rules.add(lhs_ty, rhs_ty, move |web, ctx| {
@@ -240,7 +299,7 @@ fn register_rule(
                     for stmt in &body {
                         exec_stmt(stmt, web, &mut env, &rpm);
                     }
-                    flatten_anon_bridges(&mut env, web);
+                    flatten_bridges(&mut env, web);
                 });
             }
         }
@@ -251,7 +310,7 @@ fn register_rule(
                     rule_def.lhs
                 )));
             }
-            let rpm = build_wildcard_port_map(reg, &rule_def.lhs);
+            let rpm = build_wildcard_port_map(reg, &rule_def.lhs, fragments.clone());
             check_self_ports(&rule_def.body, &rule_def.lhs, "_", &rpm)?;
             let body = rule_def.body.clone();
             rules.add_wildcard(lhs_ty, move |web, ctx| {
@@ -259,20 +318,24 @@ fn register_rule(
                 for stmt in &body {
                     exec_stmt(stmt, web, &mut env, &rpm);
                 }
-                flatten_anon_bridges(&mut env, web);
+                flatten_bridges(&mut env, web);
             });
         }
     }
     Ok(())
 }
 
-fn build_wildcard_port_map(reg: &AgentRegistry, lhs_name: &str) -> RulePortMap {
+fn build_wildcard_port_map(
+    reg: &AgentRegistry,
+    lhs_name: &str,
+    fragments: FragMap,
+) -> RulePortMap {
     let lhs_ty = reg.lookup(lhs_name).unwrap();
-    let lhs_ports = reg.def(lhs_ty).map(|d| d.ports.clone()).unwrap_or_default();
     RulePortMap {
-        lhs_ports,
+        lhs_ports: reg.def(lhs_ty).map(|d| d.ports.clone()).unwrap_or_default(),
         rhs_ports: Vec::new(),
         agents: agent_info_map(reg),
+        fragments,
     }
 }
 
@@ -321,26 +384,32 @@ fn check_self_ports(
         }
     }
 
-    let mut bad: Option<String> = None;
+    let mut counts: HashMap<String, u32> = HashMap::new();
     for s in body {
         walk_stmt(s, &mut |name| {
-            if bad.is_some() {
-                return;
-            }
-            let found = rpm.lhs_ports.iter().any(|p| p == name)
-                || rpm.rhs_ports.iter().any(|p| p == name);
-            if !found {
-                bad = Some(name.to_string());
-            }
+            *counts.entry(name.to_string()).or_insert(0) += 1;
         });
-        if bad.is_some() {
-            break;
+    }
+    // Every `~/name` used in the body must actually be an arm somewhere.
+    for name in counts.keys() {
+        let found = rpm.lhs_ports.iter().any(|p| p == name)
+            || rpm.rhs_ports.iter().any(|p| p == name);
+        if !found {
+            return Err(err(format!(
+                "rule @{lhs_name} >< @{rhs_name}: ~/{name} is not an arm of either agent"
+            )));
         }
     }
-    if let Some(name) = bad {
-        return Err(err(format!(
-            "rule @{lhs_name} >< @{rhs_name}: ~/{name} is not an arm of either agent"
-        )));
+    // Linearity: each arm (LHS + RHS) must be referenced exactly once in
+    // the body. Missing → the peer is left dangling after bloom. Repeated →
+    // the same peer gets bonded multiple times (prior bonds silently lost).
+    for name in rpm.lhs_ports.iter().chain(rpm.rhs_ports.iter()) {
+        let n = counts.get(name).copied().unwrap_or(0);
+        if n != 1 {
+            return Err(err(format!(
+                "rule @{lhs_name} >< @{rhs_name}: ~/{name} referenced {n} times — must be exactly 1"
+            )));
+        }
     }
     Ok(())
 }
@@ -373,28 +442,32 @@ struct AgentInfo {
     ports: Vec<String>, // arm port names, index order (fuse not included)
 }
 
+type FragMap = Arc<HashMap<String, ast::FragDef>>;
+
 #[derive(Clone)]
 struct RulePortMap {
     lhs_ports: Vec<String>,
     rhs_ports: Vec<String>,
     agents: HashMap<String, AgentInfo>,
+    fragments: FragMap,
 }
 
-fn build_rule_port_map(reg: &AgentRegistry, lhs_name: &str, rhs_name: &str) -> RulePortMap {
+fn build_rule_port_map(
+    reg: &AgentRegistry,
+    lhs_name: &str,
+    rhs_name: &str,
+    fragments: FragMap,
+) -> RulePortMap {
     let lhs_ty = reg.lookup(lhs_name).unwrap();
     let rhs_ty = reg.lookup(rhs_name).unwrap();
     let lhs_def = reg.def(lhs_ty);
     let rhs_def = reg.def(rhs_ty);
 
-    let lhs_ports = lhs_def.map(|d| d.ports.clone()).unwrap_or_default();
-    let rhs_ports = rhs_def.map(|d| d.ports.clone()).unwrap_or_default();
-
-    let agents = agent_info_map(reg);
-
     RulePortMap {
-        lhs_ports,
-        rhs_ports,
-        agents,
+        lhs_ports: lhs_def.map(|d| d.ports.clone()).unwrap_or_default(),
+        rhs_ports: rhs_def.map(|d| d.ports.clone()).unwrap_or_default(),
+        agents: agent_info_map(reg),
+        fragments,
     }
 }
 
@@ -427,6 +500,8 @@ struct ExecEnv {
     /// Errors collected during `@GEN` lowering. Rule-body exec is best-effort
     /// (Phase 4 will propagate those properly).
     errors: Vec<String>,
+    /// Nesting depth of `$fragment` expansions; caps at 64 to catch cycles.
+    frag_depth: u32,
 }
 
 impl ExecEnv {
@@ -437,7 +512,17 @@ impl ExecEnv {
             anon_refs: HashMap::new(),
             pending_flatten: Vec::new(),
             errors: Vec::new(),
+            frag_depth: 0,
         }
+    }
+
+    /// Fresh scope for a `$fragment` body; labels and anon bonds are
+    /// isolated from the caller so the same fragment can be inlined many
+    /// times without collisions.
+    fn for_fragment(parent_depth: u32) -> Self {
+        let mut env = Self::new();
+        env.frag_depth = parent_depth + 1;
+        env
     }
 }
 
@@ -465,10 +550,10 @@ fn eval_expr(
     match expr {
         ast::Expr::Agent { name, args, .. } => eval_agent(name, args, web, env, rpm),
         ast::Expr::Connect { lhs, rhs, .. } => eval_connect(lhs, rhs, web, env, rpm),
-        ast::Expr::PortName(name, _) => eval_label(env, web, &format!("/{name}")),
+        ast::Expr::PortName(name, _) => eval_bridge_ref(env, web, &format!("/{name}")),
         ast::Expr::SelfPort(name, _) => env.bonds.get(&format!("~/{name}")).copied(),
-        ast::Expr::AnonBond(name, _) => eval_anon(env, web, name),
-        ast::Expr::Output(_) => eval_label(env, web, ">out"),
+        ast::Expr::AnonBond(name, _) => eval_bridge_ref(env, web, &format!(">>{name}")),
+        ast::Expr::Output(_) => eval_output(env, web),
         ast::Expr::BoolLit(v, _) => {
             let ty = if *v {
                 AgentType::TRUE
@@ -480,11 +565,14 @@ fn eval_expr(
         }
         ast::Expr::BuiltinAtom(atom, _) => eval_builtin(*atom, web),
         ast::Expr::Paren(inner, _) => eval_expr(inner, web, env, rpm),
+        ast::Expr::Force(inner, _) => eval_mark(inner, web, env, rpm, Web::force),
+        ast::Expr::Inspect(inner, _) => eval_mark(inner, web, env, rpm, Web::inspect),
         ast::Expr::IntLit(n, _) => Some(lower_int(*n, web)),
         ast::Expr::CharLit(c, _) => Some(lower_char(*c, web)),
         ast::Expr::StrLit(s, _) => Some(lower_str(s, web)),
         ast::Expr::List { items, .. } => Some(lower_list(items, web, env, rpm)),
-        _ => None, // other literals, fragments, etc: later sub-phases
+        ast::Expr::Fragment(name, _) => eval_fragment(name, web, env, rpm),
+        _ => None, // other literals: later sub-phases
     }
 }
 
@@ -659,58 +747,59 @@ fn eval_connect(
     l
 }
 
-fn eval_label(env: &mut ExecEnv, web: &mut Web, key: &str) -> Option<PortId> {
-    if let Some(&pid) = env.bonds.get(key) {
-        return Some(pid);
+/// `>out` is the GEN block's output port. The runtime reads from here
+/// after reducing to slag, so it must be referenced exactly once in the
+/// user's web — a second reference would either silently overwrite the
+/// first bond (linearity break) or leave the reader unreachable.
+fn eval_output(env: &mut ExecEnv, web: &mut Web) -> Option<PortId> {
+    if env.bonds.contains_key(">out") {
+        env.errors
+            .push(">out referenced more than once in @GEN body".into());
+        return None;
     }
-    let n = web.add_atom(AgentType::NIL, 1);
-    let pid = web.atom(n).unwrap().fuse();
-    env.bonds.insert(key.to_string(), pid);
+    let nid = web.add_atom(AgentType::NIL, 1);
+    let pid = web.atom(nid).unwrap().fuse();
+    env.bonds.insert(">out".into(), pid);
     Some(pid)
 }
 
-/// `>>name` is an anonymous through-bond shared by exactly two references.
-/// The two references must end up connected directly — but we don't know
-/// either caller's port when each reference is evaluated, so we bridge
-/// through a 2-port NIL atom:
-///   - 1st ref returns NIL.arm[0]; caller A bonds its port to arm[0].
-///   - 2nd ref returns NIL.fuse; caller B bonds its port to fuse.
-///   - Scope end calls `flatten_anon_bridges` to splice A↔B directly and
-///     remove the NIL.
-fn eval_anon(env: &mut ExecEnv, web: &mut Web, name: &str) -> Option<PortId> {
-    let key = format!(">>{name}");
-    let count = env.anon_refs.entry(key.clone()).or_insert(0);
+/// A label (`/name` or `>>name`) is a single bond between exactly two
+/// textual occurrences. We don't know either endpoint's port at the
+/// moment each reference is evaluated, so we bridge through a 2-port NIL
+/// atom:
+///   1st ref returns NIL.arm[0]; the caller bonds its port there.
+///   2nd ref returns NIL.fuse; the second caller bonds its port there.
+///   Scope end: `flatten_bridges` splices the two peers directly and
+///   removes the NIL.
+/// Three references would break linearity (one port, one bond) and
+/// surface as a lowering error.
+fn eval_bridge_ref(env: &mut ExecEnv, web: &mut Web, key: &str) -> Option<PortId> {
+    let count = env.anon_refs.entry(key.to_string()).or_insert(0);
     *count += 1;
     match *count {
         1 => {
-            // First reference: allocate the bridge, return its arm[0].
             let nid = web.add_atom(AgentType::NIL, 2);
             let arm = web.atom(nid).unwrap().arms()[0];
-            env.anon_bridges.insert(key, nid);
+            env.anon_bridges.insert(key.to_string(), nid);
             Some(arm)
         }
         2 => {
-            // Second reference: return bridge's fuse; mark for flatten.
-            let nid = env.anon_bridges.remove(&key)?;
+            let nid = env.anon_bridges.remove(key)?;
             env.pending_flatten.push(nid);
             web.atom(nid).map(|n| n.fuse())
         }
-        _ => {
-            // A third reference would break linearity (one port, one bond).
-            env.errors.push(format!(
-                "anonymous bond {key} referenced {} times — must be exactly 2",
-                count
-            ));
+        n => {
+            env.errors
+                .push(format!("{key} referenced {n} times — must be exactly 2"));
             None
         }
     }
 }
 
-/// Short-circuit each bridge NIL created by `eval_anon`: take its two
-/// endpoints' peers, remove the bridge, and bond the peers together.
-/// Any bridge that never received its second reference becomes a
-/// linearity error.
-fn flatten_anon_bridges(env: &mut ExecEnv, web: &mut Web) {
+/// Short-circuit every bridge NIL created by `eval_bridge_ref`: take its
+/// two endpoints' peers, remove the bridge, and bond the peers directly.
+/// A bridge that never saw its second reference is a linearity error.
+fn flatten_bridges(env: &mut ExecEnv, web: &mut Web) {
     for nid in env.pending_flatten.drain(..) {
         let Some(atom) = web.atom(nid) else {
             continue;
@@ -724,12 +813,28 @@ fn flatten_anon_bridges(env: &mut ExecEnv, web: &mut Web) {
             web.link(pa, pb);
         }
     }
-    for (name, nid) in env.anon_bridges.drain() {
+    for (key, nid) in env.anon_bridges.drain() {
         web.remove_atom(nid);
         env.errors
-            .push(format!("anonymous bond {name} referenced once — must be exactly 2"));
+            .push(format!("{key} referenced once — must be exactly 2"));
     }
     env.anon_refs.clear();
+}
+
+/// `!expr` and `?expr` — evaluate the inner expression, then tag the atom
+/// it resolved to. `!` (priority) or `?` (inspection) differ only in
+/// which setter we call on `Web`.
+fn eval_mark(
+    inner: &ast::Expr,
+    web: &mut Web,
+    env: &mut ExecEnv,
+    rpm: &RulePortMap,
+    mark: fn(&mut Web, AtomId),
+) -> Option<PortId> {
+    let pid = eval_expr(inner, web, env, rpm)?;
+    let atom_id = web.port(pid)?.atom;
+    mark(web, atom_id);
+    Some(pid)
 }
 
 fn eval_builtin(atom: ast::BuiltinAtom, web: &mut Web) -> Option<PortId> {
@@ -742,15 +847,45 @@ fn eval_builtin(atom: ast::BuiltinAtom, web: &mut Web) -> Option<PortId> {
     Some(web.atom(nid).unwrap().fuse())
 }
 
+const FRAG_DEPTH_LIMIT: u32 = 64;
+
+/// Inline a fresh copy of `$name`'s body. Each call gets its own ExecEnv
+/// so labels and anon bonds in the body never collide with the caller or
+/// with another expansion of the same fragment.
+fn eval_fragment(
+    name: &str,
+    web: &mut Web,
+    env: &mut ExecEnv,
+    rpm: &RulePortMap,
+) -> Option<PortId> {
+    if env.frag_depth >= FRAG_DEPTH_LIMIT {
+        env.errors.push(format!(
+            "fragment ${name} exceeded depth {FRAG_DEPTH_LIMIT} — cycle?"
+        ));
+        return None;
+    }
+    let Some(frag) = rpm.fragments.get(name) else {
+        env.errors.push(format!("unknown fragment ${name}"));
+        return None;
+    };
+    let mut sub = ExecEnv::for_fragment(env.frag_depth);
+    let out = eval_expr(&frag.value, web, &mut sub, rpm);
+    flatten_bridges(&mut sub, web);
+    env.errors.extend(sub.errors);
+    out
+}
+
 fn lower_gen(
     block: &ast::GenBlock,
     reg: &AgentRegistry,
+    fragments: &FragMap,
     web: &mut Web,
 ) -> Result<PortId, LowerError> {
     let rpm = RulePortMap {
         lhs_ports: vec![],
         rhs_ports: vec![],
         agents: agent_info_map(reg),
+        fragments: fragments.clone(),
     };
 
     // Each @GEN is an independent component → fresh bond env so >out doesn't leak between blocks.
@@ -759,7 +894,7 @@ fn lower_gen(
     for stmt in &block.body {
         exec_stmt(stmt, web, &mut env, &rpm);
     }
-    flatten_anon_bridges(&mut env, web);
+    flatten_bridges(&mut env, web);
 
     if let Some(msg) = env.errors.into_iter().next() {
         return Err(err(msg));

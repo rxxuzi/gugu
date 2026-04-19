@@ -18,6 +18,17 @@ pub enum RunResult {
     MaxSteps(u64),
 }
 
+/// Per-bloom context passed to `Reducer::run_traced` callbacks.
+#[derive(Debug, Clone, Copy)]
+pub struct BloomInfo {
+    /// 1-based bloom count (matches the final `# N bloom(s)` report).
+    pub count: u64,
+    pub a: AgentType,
+    pub b: AgentType,
+    /// Either atom was marked with `?expr`.
+    pub inspected: bool,
+}
+
 pub struct Reducer {
     pub web: Web,
     rules: RuleTable,
@@ -39,27 +50,58 @@ impl Reducer {
 
     /// Perform one bloom. Returns `Slag` if no rule can fire.
     pub fn step(&mut self) -> StepResult {
-        let pairs = self.web.sparks();
-        for (a, b) in pairs {
-            let agent_a = self.web.atom(a).unwrap().agent;
-            let agent_b = self.web.atom(b).unwrap().agent;
-            if self.can_bloom(agent_a, agent_b) {
-                self.bloom(a, b, agent_a, agent_b);
-                self.blooms += 1;
-                return StepResult::Bloomed;
-            }
+        match self.step_inner() {
+            Some(_) => StepResult::Bloomed,
+            None => StepResult::Slag,
         }
-        StepResult::Slag
     }
 
     /// Run until slag or `max_steps` reached.
     pub fn run(&mut self, max_steps: u64) -> RunResult {
+        self.run_traced(max_steps, |_| {})
+    }
+
+    /// Same as `run`, but `on_bloom(info)` is called before each bloom.
+    /// `info.inspected` is true when either atom in the spark was marked
+    /// with `?expr` — the CLI uses this to route `?` output even when
+    /// `--trace` is off.
+    pub fn run_traced(
+        &mut self,
+        max_steps: u64,
+        mut on_bloom: impl FnMut(BloomInfo),
+    ) -> RunResult {
         for _ in 0..max_steps {
-            if self.step() == StepResult::Slag {
-                return RunResult::Slag(self.blooms);
+            match self.step_inner() {
+                None => return RunResult::Slag(self.blooms),
+                Some(info) => on_bloom(info),
             }
         }
         RunResult::MaxSteps(self.blooms)
+    }
+
+    fn step_inner(&mut self) -> Option<BloomInfo> {
+        let mut pairs = self.web.sparks();
+        // `!expr` priority: sparks touching a forced atom fire first. Stable
+        // sort so the order among non-forced sparks stays as before.
+        pairs.sort_by_key(|&(a, b)| {
+            !(self.web.is_forced(a) || self.web.is_forced(b))
+        });
+        for (a, b) in pairs {
+            let agent_a = self.web.atom(a).unwrap().agent;
+            let agent_b = self.web.atom(b).unwrap().agent;
+            if self.can_bloom(agent_a, agent_b) {
+                let inspected = self.web.is_inspected(a) || self.web.is_inspected(b);
+                self.bloom(a, b, agent_a, agent_b);
+                self.blooms += 1;
+                return Some(BloomInfo {
+                    count: self.blooms,
+                    a: agent_a,
+                    b: agent_b,
+                    inspected,
+                });
+            }
+        }
+        None
     }
 
     fn can_bloom(&self, a: AgentType, b: AgentType) -> bool {

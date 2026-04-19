@@ -594,15 +594,14 @@ impl Parser {
                     Some(TokenKind::PortName(_)) if self.is_port_assign() => {
                         args.push(AgentArg::Port(self.parse_port_assign()?));
                     }
-                    // (expr)  ->  positional arg via explicit paren
+                    // (expr)  ->  positional arg via explicit paren.
+                    // `$frag` as bare positional is disallowed so a sequence
+                    // of frag defs like `$a = @X(...) $b = ...` doesn't get
+                    // its next `$b` swallowed by `@X`; wrap in parens if you
+                    // really want `@X($b)`.
                     Some(TokenKind::LParen) => {
                         let paren = self.parse_paren()?;
                         args.push(AgentArg::Positional(paren));
-                    }
-                    // $fragment as arg (consumed directly)
-                    Some(TokenKind::Fragment(_)) => {
-                        let arg = self.parse_atom()?;
-                        args.push(AgentArg::Positional(arg));
                     }
                     _ => break,
                 }

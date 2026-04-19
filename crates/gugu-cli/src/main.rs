@@ -8,6 +8,7 @@ fn main() {
         eprintln!();
         eprintln!("commands:");
         eprintln!("  run [--trace] <file.gu>   Run a .gu program");
+        eprintln!("  test <file.gu>            Run every `test \"...\"` block");
         eprintln!("  check <file.gu>           Parse and type-check (no execution)");
         eprintln!("  lex <file.gu>             Dump tokens");
         process::exit(1);
@@ -16,6 +17,7 @@ fn main() {
     let cmd = &args[1];
     match cmd.as_str() {
         "run" => cmd_run(&args[2..]),
+        "test" => cmd_test(&args[2..]),
         "check" => cmd_check(&args[2..]),
         "lex" => cmd_lex(&args[2..]),
         other => {
@@ -76,6 +78,40 @@ fn cmd_run(args: &[String]) {
             eprintln!("runtime error: {e}");
             process::exit(1);
         }
+    }
+}
+
+fn cmd_test(args: &[String]) {
+    let src = read_file(args);
+    let program = match gugu_parser::parse(&src) {
+        Ok(p) => p,
+        Err(e) => {
+            eprintln!("parse error: {e}");
+            process::exit(1);
+        }
+    };
+
+    let outcomes = gugu_runtime::run_tests(&program);
+    if outcomes.is_empty() {
+        eprintln!("no `test` blocks in this file");
+        return;
+    }
+
+    let (mut pass, mut fail) = (0u32, 0u32);
+    for o in &outcomes {
+        if o.pass {
+            pass += 1;
+            println!("pass  {:?}", o.label);
+        } else {
+            fail += 1;
+            println!("FAIL  {:?}", o.label);
+            println!("    lhs = {}", o.lhs);
+            println!("    rhs = {}", o.rhs);
+        }
+    }
+    println!("# {pass} passed, {fail} failed");
+    if fail > 0 {
+        process::exit(1);
     }
 }
 

@@ -1,7 +1,7 @@
 //! Execution: lower + reduce + extract result.
 
 use gugu_core::{AgentType, AtomId, PortId, Web};
-use gugu_parser::ast::Program;
+use gugu_parser::ast::{self, Expr, GenBlock, Program, Stmt, TestBlock};
 use gugu_reducer::{BloomInfo, Reducer, RunResult};
 
 use crate::lower::{self, AgentRegistry, LowerError, LowerResult};
@@ -86,6 +86,96 @@ fn agent_name_of(reg: &AgentRegistry, ty: AgentType) -> String {
     reg.def(ty)
         .map(|d| d.name.clone())
         .unwrap_or_else(|| format!("?{}", ty.raw()))
+}
+
+/// Outcome of a single `test "..." : lhs == rhs` block.
+#[derive(Debug, Clone)]
+pub struct TestOutcome {
+    pub label: String,
+    pub pass: bool,
+    /// Formatted slag on the lhs side. On lowering / max-steps errors this
+    /// holds the error message and `rhs` is empty.
+    pub lhs: String,
+    pub rhs: String,
+}
+
+/// Run every `test "..." : lhs == rhs` block declared in the program.
+/// Each test is executed as its own mini-program (the user's agent / rule
+/// / fragment declarations come along, but the original `@GEN` blocks are
+/// dropped) with two synthesized `@GEN` blocks wiring `lhs` and `rhs` to
+/// a fresh `>out`. A test passes iff the two formatted outputs match.
+pub fn run_tests(program: &Program) -> Vec<TestOutcome> {
+    program
+        .items
+        .iter()
+        .filter_map(|it| match it {
+            ast::TopLevel::Test(t) => Some(run_one_test(program, t)),
+            _ => None,
+        })
+        .collect()
+}
+
+fn run_one_test(program: &Program, test: &TestBlock) -> TestOutcome {
+    let mini = Program {
+        pack: program.pack.clone(),
+        uses: program.uses.clone(),
+        items: program.items.clone(),
+        gens: vec![wrap_as_gen(test.lhs.clone()), wrap_as_gen(test.rhs.clone())],
+    };
+    match exec(&mini) {
+        Ok(result) => {
+            let outs = read_outputs(&result);
+            let lhs = outs.first().cloned().unwrap_or_default();
+            let rhs = outs.get(1).cloned().unwrap_or_default();
+            TestOutcome {
+                label: test.label.clone(),
+                pass: lhs == rhs,
+                lhs,
+                rhs,
+            }
+        }
+        Err(e) => TestOutcome {
+            label: test.label.clone(),
+            pass: false,
+            lhs: format!("<error: {e}>"),
+            rhs: String::new(),
+        },
+    }
+}
+
+fn wrap_as_gen(expr: Expr) -> GenBlock {
+    let span = expr.span();
+    // Only auto-bond to `>out` when the expression doesn't already place
+    // the result there itself. `test "..." : @ADD /rgt=(>out) -> 1 == 2`
+    // puts >out inside the lhs; forcing another `-> >out` would break
+    // the single-use rule and surface as a lowering error.
+    let stmt = if refs_output(&expr) {
+        Stmt::Expr(expr)
+    } else {
+        Stmt::Expr(Expr::Connect {
+            lhs: Box::new(expr),
+            rhs: Box::new(Expr::Output(span)),
+            span,
+        })
+    };
+    GenBlock {
+        body: vec![stmt],
+        span,
+    }
+}
+
+fn refs_output(e: &Expr) -> bool {
+    match e {
+        Expr::Output(_) => true,
+        Expr::Agent { args, .. } => args.iter().any(|a| match a {
+            ast::AgentArg::Port(pa) => refs_output(&pa.value),
+            ast::AgentArg::Positional(e) => refs_output(e),
+        }),
+        Expr::Connect { lhs, rhs, .. } => refs_output(lhs) || refs_output(rhs),
+        Expr::Paren(i, _) | Expr::Force(i, _) | Expr::Inspect(i, _) => refs_output(i),
+        Expr::List { items, .. } => items.iter().any(refs_output),
+        _ => false,
+    }
 }
 
 /// Read the results from each `@GEN`'s `>out`, in declaration order.

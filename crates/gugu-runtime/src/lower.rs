@@ -27,10 +27,19 @@ fn err(msg: impl Into<String>) -> LowerError {
     LowerError { msg: msg.into() }
 }
 
+/// Visibility metadata for user-declared agents. Built-ins have no entry
+/// and are treated as globally visible.
+#[derive(Debug, Clone)]
+pub struct AgentMeta {
+    pub mod_name: Option<String>,
+    pub is_pub: bool,
+}
+
 /// Maps agent names to their types and definitions.
 pub struct AgentRegistry {
     by_name: HashMap<String, AgentType>,
     defs: HashMap<AgentType, AgentDef>,
+    meta: HashMap<AgentType, AgentMeta>,
     next_user: u32,
 }
 
@@ -39,6 +48,7 @@ impl AgentRegistry {
         let mut reg = Self {
             by_name: HashMap::new(),
             defs: HashMap::new(),
+            meta: HashMap::new(),
             next_user: 0,
         };
         // Built-in agents
@@ -67,13 +77,24 @@ impl AgentRegistry {
     }
 
     pub fn register(&mut self, name: &str, ports: Vec<String>) -> AgentType {
+        self.register_with_meta(name, ports, None, true)
+    }
+
+    pub fn register_with_meta(
+        &mut self,
+        name: &str,
+        ports: Vec<String>,
+        mod_name: Option<String>,
+        is_pub: bool,
+    ) -> AgentType {
         if let Some(&ty) = self.by_name.get(name) {
             return ty;
         }
         let ty = AgentType::user(self.next_user);
         self.next_user += 1;
         self.by_name.insert(name.into(), ty);
-        self.defs.insert(ty, AgentDef::new(ty, name, ports.clone()));
+        self.defs.insert(ty, AgentDef::new(ty, name, ports));
+        self.meta.insert(ty, AgentMeta { mod_name, is_pub });
         ty
     }
 
@@ -85,8 +106,26 @@ impl AgentRegistry {
         self.defs.get(&ty)
     }
 
+    pub fn meta(&self, ty: AgentType) -> Option<&AgentMeta> {
+        self.meta.get(&ty)
+    }
+
     pub fn arity(&self, ty: AgentType) -> u32 {
         self.defs.get(&ty).map(|d| d.arity() as u32).unwrap_or(1)
+    }
+
+    /// Can an agent declared in `agent_mod` (with visibility `is_pub`) be
+    /// referenced from the scope `from_mod`?  Global-scope agents are
+    /// always visible; mod-scoped ones need either the `pub` keyword or
+    /// a same-mod reference.
+    pub fn is_visible_from(&self, ty: AgentType, from_mod: Option<&str>) -> bool {
+        match self.meta.get(&ty) {
+            None => true, // builtin
+            Some(m) => match &m.mod_name {
+                None => true,
+                Some(owner) => m.is_pub || Some(owner.as_str()) == from_mod,
+            },
+        }
     }
 }
 
@@ -155,18 +194,18 @@ pub fn lower(program: &ast::Program) -> Result<LowerResult, LowerError> {
     for prog in &stdlib_programs {
         for item in &prog.items {
             if let ast::TopLevel::Rule(rule_def) = item {
-                register_rule(rule_def, &reg, &mut rules, &fragments)?;
+                register_rule(rule_def, &reg, &mut rules, &fragments, None)?;
             }
         }
     }
     for item in &program.items {
         if let ast::TopLevel::Rule(rule_def) = item {
-            register_rule(rule_def, &reg, &mut rules, &fragments)?;
+            register_rule(rule_def, &reg, &mut rules, &fragments, None)?;
         }
         if let ast::TopLevel::Mod(mod_def) = item {
             for mi in &mod_def.items {
                 if let ast::ModItem::Rule(rule_def) = mi {
-                    register_rule(rule_def, &reg, &mut rules, &fragments)?;
+                    register_rule(rule_def, &reg, &mut rules, &fragments, Some(&mod_def.name))?;
                 }
             }
         }
@@ -188,11 +227,11 @@ pub fn lower(program: &ast::Program) -> Result<LowerResult, LowerError> {
 
 fn register_agents(item: &ast::TopLevel, reg: &mut AgentRegistry) -> Result<(), LowerError> {
     match item {
-        ast::TopLevel::Agent(a) => register_one_agent(a, reg)?,
+        ast::TopLevel::Agent(a) => register_one_agent(a, reg, None)?,
         ast::TopLevel::Mod(m) => {
             for mi in &m.items {
                 if let ast::ModItem::Agent(a) = mi {
-                    register_one_agent(a, reg)?;
+                    register_one_agent(a, reg, Some(m.name.as_str()))?;
                 }
             }
         }
@@ -245,7 +284,11 @@ fn find_self_port(e: &ast::Expr) -> Option<String> {
     }
 }
 
-fn register_one_agent(a: &ast::AgentDef, reg: &mut AgentRegistry) -> Result<(), LowerError> {
+fn register_one_agent(
+    a: &ast::AgentDef,
+    reg: &mut AgentRegistry,
+    mod_name: Option<&str>,
+) -> Result<(), LowerError> {
     let ports: Vec<String> = a
         .ports
         .iter()
@@ -266,7 +309,7 @@ fn register_one_agent(a: &ast::AgentDef, reg: &mut AgentRegistry) -> Result<(), 
             }
         }
     }
-    reg.register(&a.name, ports);
+    reg.register_with_meta(&a.name, ports, mod_name.map(String::from), a.is_pub);
     Ok(())
 }
 
@@ -275,6 +318,7 @@ fn register_rule(
     reg: &AgentRegistry,
     rules: &mut RuleTable,
     fragments: &FragMap,
+    current_mod: Option<&str>,
 ) -> Result<(), LowerError> {
     let lhs_ty = reg
         .lookup(&rule_def.lhs)
@@ -291,8 +335,15 @@ fn register_rule(
                         rule_def.lhs, rhs_name
                     )));
                 }
-                let rpm = build_rule_port_map(reg, &rule_def.lhs, rhs_name, fragments.clone());
+                let rpm = build_rule_port_map(
+                    reg,
+                    &rule_def.lhs,
+                    rhs_name,
+                    fragments.clone(),
+                    current_mod,
+                );
                 check_self_ports(&rule_def.body, &rule_def.lhs, rhs_name, &rpm)?;
+                check_agent_visibility(&rule_def.body, reg, current_mod)?;
                 let body = rule_def.body.clone();
                 rules.add(lhs_ty, rhs_ty, move |web, ctx| {
                     let mut env = build_rule_env(ctx, &rpm);
@@ -310,8 +361,9 @@ fn register_rule(
                     rule_def.lhs
                 )));
             }
-            let rpm = build_wildcard_port_map(reg, &rule_def.lhs, fragments.clone());
+            let rpm = build_wildcard_port_map(reg, &rule_def.lhs, fragments.clone(), current_mod);
             check_self_ports(&rule_def.body, &rule_def.lhs, "_", &rpm)?;
+            check_agent_visibility(&rule_def.body, reg, current_mod)?;
             let body = rule_def.body.clone();
             rules.add_wildcard(lhs_ty, move |web, ctx| {
                 let mut env = build_rule_env(ctx, &rpm);
@@ -329,6 +381,7 @@ fn build_wildcard_port_map(
     reg: &AgentRegistry,
     lhs_name: &str,
     fragments: FragMap,
+    current_mod: Option<&str>,
 ) -> RulePortMap {
     let lhs_ty = reg.lookup(lhs_name).unwrap();
     RulePortMap {
@@ -336,6 +389,7 @@ fn build_wildcard_port_map(
         rhs_ports: Vec::new(),
         agents: agent_info_map(reg),
         fragments,
+        current_mod: current_mod.map(String::from),
     }
 }
 
@@ -414,6 +468,72 @@ fn check_self_ports(
     Ok(())
 }
 
+fn check_agent_visibility(
+    body: &[ast::Stmt],
+    reg: &AgentRegistry,
+    current_mod: Option<&str>,
+) -> Result<(), LowerError> {
+    fn walk_stmt(s: &ast::Stmt, visit: &mut impl FnMut(&str)) {
+        match s {
+            ast::Stmt::Bond { lhs, rhs, .. } => {
+                walk_expr(lhs, visit);
+                walk_expr(rhs, visit);
+            }
+            ast::Stmt::Expr(e) => walk_expr(e, visit),
+        }
+    }
+    fn walk_expr(e: &ast::Expr, visit: &mut impl FnMut(&str)) {
+        match e {
+            ast::Expr::Agent { name, args, .. } => {
+                visit(name);
+                for a in args {
+                    match a {
+                        ast::AgentArg::Port(pa) => walk_expr(&pa.value, visit),
+                        ast::AgentArg::Positional(e) => walk_expr(e, visit),
+                    }
+                }
+            }
+            ast::Expr::Connect { lhs, rhs, .. } => {
+                walk_expr(lhs, visit);
+                walk_expr(rhs, visit);
+            }
+            ast::Expr::Paren(i, _) | ast::Expr::Force(i, _) | ast::Expr::Inspect(i, _) => {
+                walk_expr(i, visit);
+            }
+            ast::Expr::List { items, .. } => {
+                for it in items {
+                    walk_expr(it, visit);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    let mut bad: Option<(String, String)> = None;
+    for s in body {
+        walk_stmt(s, &mut |name| {
+            if bad.is_some() {
+                return;
+            }
+            if let Some(ty) = reg.lookup(name)
+                && !reg.is_visible_from(ty, current_mod)
+                && let Some(owner) = reg.meta(ty).and_then(|m| m.mod_name.clone())
+            {
+                bad = Some((name.to_string(), owner));
+            }
+        });
+        if bad.is_some() {
+            break;
+        }
+    }
+    if let Some((name, owner)) = bad {
+        return Err(err(format!(
+            "agent @{name} is private in mod {owner} — declare it `pub` to reference it from outside"
+        )));
+    }
+    Ok(())
+}
+
 /// Populate bond env from the saved arm-port peers.
 ////// Rule bodies reference arm ports as `~/name`. Both LHS and RHS arm peers
 /// are inserted under that single namespace, because there is no surface
@@ -440,6 +560,8 @@ struct AgentInfo {
     ty: AgentType,
     arity: u32,
     ports: Vec<String>, // arm port names, index order (fuse not included)
+    mod_name: Option<String>,
+    is_pub: bool,
 }
 
 type FragMap = Arc<HashMap<String, ast::FragDef>>;
@@ -450,6 +572,10 @@ struct RulePortMap {
     rhs_ports: Vec<String>,
     agents: HashMap<String, AgentInfo>,
     fragments: FragMap,
+    /// Mod in which the rule body / GEN block was declared. `None` for
+    /// top-level code. Used to gate access to non-`pub` agents declared
+    /// in other mods.
+    current_mod: Option<String>,
 }
 
 fn build_rule_port_map(
@@ -457,6 +583,7 @@ fn build_rule_port_map(
     lhs_name: &str,
     rhs_name: &str,
     fragments: FragMap,
+    current_mod: Option<&str>,
 ) -> RulePortMap {
     let lhs_ty = reg.lookup(lhs_name).unwrap();
     let rhs_ty = reg.lookup(rhs_name).unwrap();
@@ -468,6 +595,7 @@ fn build_rule_port_map(
         rhs_ports: rhs_def.map(|d| d.ports.clone()).unwrap_or_default(),
         agents: agent_info_map(reg),
         fragments,
+        current_mod: current_mod.map(String::from),
     }
 }
 
@@ -475,12 +603,18 @@ fn agent_info_map(reg: &AgentRegistry) -> HashMap<String, AgentInfo> {
     let mut agents = HashMap::new();
     for (name, &ty) in &reg.by_name {
         let ports = reg.def(ty).map(|d| d.ports.clone()).unwrap_or_default();
+        let (mod_name, is_pub) = reg
+            .meta(ty)
+            .map(|m| (m.mod_name.clone(), m.is_pub))
+            .unwrap_or((None, true));
         agents.insert(
             name.clone(),
             AgentInfo {
                 ty,
                 arity: reg.arity(ty),
                 ports,
+                mod_name,
+                is_pub,
             },
         );
     }
@@ -685,6 +819,15 @@ fn eval_agent(
     rpm: &RulePortMap,
 ) -> Option<PortId> {
     let info = rpm.agents.get(name)?.clone();
+    if let Some(owner) = &info.mod_name {
+        let same_mod = rpm.current_mod.as_deref() == Some(owner.as_str());
+        if !info.is_pub && !same_mod {
+            env.errors.push(format!(
+                "agent @{name} is private in mod {owner} — declare it `pub` to reference it from outside"
+            ));
+            return None;
+        }
+    }
     let nid = web.add_atom(info.ty, info.arity);
     let fuse = web.atom(nid).unwrap().fuse();
     let arm: Vec<PortId> = web.atom(nid).unwrap().arms().to_vec();
@@ -886,6 +1029,7 @@ fn lower_gen(
         rhs_ports: vec![],
         agents: agent_info_map(reg),
         fragments: fragments.clone(),
+        current_mod: None,
     };
 
     // Each @GEN is an independent component → fresh bond env so >out doesn't leak between blocks.
